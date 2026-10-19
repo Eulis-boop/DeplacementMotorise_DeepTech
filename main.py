@@ -419,8 +419,13 @@ class MainWindow(QMainWindow):
                 self.pending = None
         elif kind == "moving":
             self.motion_busy = True
+        elif kind == "stationary":
+            # Arduino responds to STOP without any subsequent HOLDING line
+            # when it was already stopped. Never leave the GUI stuck busy.
+            self.pending = None
+            self.motion_busy = False
         elif kind in ("completed", "stopped"):
-            # Do not clear pending until position + HOLDING have been received.
+            # Actual motion completion is followed by position and HOLDING.
             self.motion_busy = True
         elif kind == "position":
             if self.arduino_initialized:
@@ -524,7 +529,11 @@ class MainWindow(QMainWindow):
 
     def stop_motion(self):
         if self.real_mode and self.serial_manager.is_connected:
-            # STOP remains available even during a pending movement.
+            if not self.motion_busy and not self.pending:
+                self.log.append("Aucun mouvement en cours : STOP inutile.")
+                return
+            # STOP remains available while a movement is pending.
+            # Never replace the pending movement with an untracked command.
             self.send_real("STOP", self.pending)
         elif not self.real_mode:
             self.log.append("Simulation : aucun mouvement en cours.")

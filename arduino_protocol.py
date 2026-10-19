@@ -15,8 +15,10 @@ def parse_message(line):
         return ("moving", None)
     if line in ("Target command completed.", "Already at nearest motor position."):
         return ("completed", None)
-    if line in ("Motion stopped.", "Motor is already stationary."):
+    if line == "Motion stopped.":
         return ("stopped", None)
+    if line == "Motor is already stationary.":
+        return ("stationary", None)
     if line == "State: HOLDING":
         return ("idle", None)
     if line == "State: MOVING":

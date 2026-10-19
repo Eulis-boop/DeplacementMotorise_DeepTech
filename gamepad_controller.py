@@ -30,27 +30,33 @@ class GamepadController(QObject):
         self.last_stop = False
         self.status_changed.emit(f"Manette : {self.joystick.get_name()}")
 
+    
     def poll_gamepad(self):
         for event in pygame.event.get():
-            if event.type == pygame.JOYDEVICEREMOVED and self.joystick is not None:
+
+            if event.type == pygame.JOYDEVICEREMOVED:
                 self.joystick = None
                 self.last_direction = 0
                 self.status_changed.emit("Manette déconnectée")
                 self.stop_requested.emit()
                 return
-        if self.joystick is None or not self.joystick.get_init():
-            return
-        # Typical first hat = horizontal D-pad. Not all controllers have hats.
-        direction = self.joystick.get_hat(0)[0] if self.joystick.get_numhats() else 0
-        if direction != 0 and self.last_direction == 0:
-            self.move_requested.emit(direction)
-        self.last_direction = direction
-        # Button indices differ by controller: test mapping before using this as STOP.
-        if self.joystick.get_numbuttons() > 1:
-            pressed = bool(self.joystick.get_button(1))
-            if pressed and not self.last_stop:
-                self.stop_requested.emit()
-            self.last_stop = pressed
+
+            if self.joystick is None:
+                continue
+
+            if event.type == pygame.JOYBUTTONDOWN:
+
+                # LB : Reculer
+                if event.button == 9:
+                    self.move_requested.emit(-1)
+
+                # RB : Avancer
+                elif event.button == 10:
+                    self.move_requested.emit(1)
+
+                # IMPORTANT :
+                # Le bouton STOP reste géré
+                # par le code existant.
 
     def close(self):
         self.timer.stop()
