@@ -1,4 +1,4 @@
-"""DeepTech — simulation / Arduino controller, with optional gamepad."""
+"""DeepTech — Déplacement motorisé"""
 
 import sys
 

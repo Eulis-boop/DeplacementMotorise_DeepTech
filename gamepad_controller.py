@@ -18,6 +18,15 @@ class GamepadController(QObject):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll_gamepad)
         self.timer.start(50)
+        # Configuration provisoire des gâchettes
+        self.lt_axis = 5
+        self.rt_axis = 4
+
+        self.lt_pressed = False
+        self.rt_pressed = False
+
+        self.press_threshold = 0.5
+        self.release_threshold = -0.2
 
     def connect_gamepad(self):
         pygame.event.pump()
@@ -54,10 +63,40 @@ class GamepadController(QObject):
                 elif event.button == 10:
                     self.move_requested.emit(1)
 
-                # IMPORTANT :
-                # Le bouton STOP reste géré
-                # par le code existant.
+            if self.joystick is None or not self.joystick.get_init():
+                return
+            # Typical first hat = horizontal D-pad. Not all controllers have hats.
+            direction = self.joystick.get_hat(0)[0] if self.joystick.get_numhats() else 0
+            if direction != 0 and self.last_direction == 0:
+                self.move_requested.emit(direction)
+            self.last_direction = direction
+            # Button indices differ by controller: test mapping before using this as STOP.
+            if self.joystick.get_numbuttons() > 1:
+                pressed = bool(self.joystick.get_button(1))
+                if pressed and not self.last_stop:
+                    self.stop_requested.emit()
+                self.last_stop = pressed            
+
+            if event.type == pygame.JOYAXISMOTION:
+                self.process_trigger(event.axis, event.value)
 
     def close(self):
         self.timer.stop()
         pygame.quit()
+
+    def process_trigger(self, axis, value):
+        if axis == self.lt_axis:
+            if value >= self.press_threshold and not self.lt_pressed:
+                self.lt_pressed = True
+                self.move_requested.emit(-1)  # Reculer
+
+            elif value <= self.release_threshold:
+                self.lt_pressed = False
+
+        elif axis == self.rt_axis:
+            if value >= self.press_threshold and not self.rt_pressed:
+                self.rt_pressed = True
+                self.move_requested.emit(1)  # Avancer
+
+            elif value <= self.release_threshold:
+                self.rt_pressed = False

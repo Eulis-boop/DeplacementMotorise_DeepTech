@@ -93,7 +93,7 @@ MicrometerConfig defaults() {
   c.maxMM = 25.000f;
 
   c.divisionMM = 0.001f;
-  c.pitchMM = 0.050f;
+  c.pitchMM = 0.500f;
   c.gearRatio = 1.0f;
 
   c.jogMM = 0.010f;
