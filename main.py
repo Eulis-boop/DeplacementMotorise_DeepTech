@@ -1,11 +1,12 @@
-"""DeepTech — micrometric stage graphical interface (simulation)."""
+"""DeepTech — simulation / Arduino controller, with optional gamepad."""
 
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
     QLineEdit,
     QFrame,
     QGridLayout,
@@ -23,6 +24,9 @@ from PySide6.QtWidgets import (
 
 from motor_config import MAX_POSITION_MM, MIN_POSITION_MM
 from motor_controller import MotionController
+from serial_manager import SerialManager
+from arduino_protocol import parse_message
+from gamepad_controller import GamepadController
 
 
 STYLE = """
@@ -116,6 +120,17 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.motor = MotionController()
+        self.serial_manager = SerialManager(self)
+        self.serial_manager.message_received.connect(self.on_serial_message)
+        self.serial_manager.disconnected.connect(self.on_serial_disconnected)
+        self.serial_manager.error_occurred.connect(self.on_serial_error)
+        self.serial_manager.connected.connect(lambda: self.log.append("USB connecté. Attente du démarrage Arduino."))
+        self.arduino_initialized = False
+        self.arduino_position = None
+        self.arduino_origin = None
+        self.motion_busy = False
+        self.pending = None
+        self.gamepad = None
         self.setWindowTitle("DeepTech | Déplacement motorisé")
         self.resize(750, 790)
         self.setMinimumSize(570, 590)
@@ -141,7 +156,8 @@ class MainWindow(QMainWindow):
         project.setObjectName("projectTitle")
         subtitle = QLabel("Contrôle de la platine micrométrique · Axe X")
         subtitle.setObjectName("projectSubtitle")
-        badge = QLabel("MODE SIMULATION")
+        self.badge = QLabel("MODE SIMULATION")
+        badge = self.badge
         badge.setObjectName("modeBadge")
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header_layout.addWidget(course)
@@ -150,6 +166,34 @@ class MainWindow(QMainWindow):
         header_layout.addSpacing(8)
         header_layout.addWidget(badge, alignment=Qt.AlignmentFlag.AlignLeft)
         body.addWidget(header)
+
+        # USB connection: no motion until checked and manually calibrated
+        usb_card, usb_layout = make_card("00   Connexion et mode")
+        usb_row = QHBoxLayout()
+        self.mode_selector = QComboBox()
+        self.mode_selector.addItems(["Simulation", "Arduino USB"])
+        self.mode_selector.currentIndexChanged.connect(self.change_mode)
+        usb_row.addWidget(self.mode_selector)
+        self.port_selector = QComboBox()
+        usb_row.addWidget(self.port_selector, 2)
+        self.refresh_button = QPushButton("Actualiser")
+        self.refresh_button.clicked.connect(self.refresh_ports)
+        usb_row.addWidget(self.refresh_button)
+        self.connection_button = QPushButton("Connecter")
+        self.connection_button.clicked.connect(self.toggle_connection)
+        usb_row.addWidget(self.connection_button)
+        usb_layout.addLayout(usb_row)
+        self.hardware_check = QCheckBox(
+            "Configuration Arduino vérifiée (pitch 0,5 mm/tour, course sûre, micro-pas et sens)"
+        )
+        self.hardware_check.setChecked(False)
+        self.hardware_check.stateChanged.connect(self.update_position)
+        usb_layout.addWidget(self.hardware_check)
+        self.usb_status = QLabel("Mode simulation. Aucun moteur réel commandé.")
+        self.usb_status.setObjectName("hint")
+        usb_layout.addWidget(self.usb_status)
+        body.addWidget(usb_card)
+        self.refresh_ports()
 
         # Initial position
         init_card, init_layout = make_card("01   Initialisation")
@@ -238,7 +282,23 @@ class MainWindow(QMainWindow):
         controls_grid.addWidget(absolute_card, 0, 1)
         body.addLayout(controls_grid)
 
-        log_card, log_layout = make_card("05   Journal des événements")
+        safety_card, safety_layout = make_card("05   Arrêt et manette")
+        safety_row = QHBoxLayout()
+        self.stop_button = QPushButton("STOP — Décélérer et arrêter")
+        self.stop_button.setStyleSheet("background:#fce8e8; color:#9c2431; border:1px solid #eab5b8;")
+        self.stop_button.clicked.connect(self.stop_motion)
+        safety_row.addWidget(self.stop_button)
+        self.gamepad_button = QPushButton("Détecter la manette")
+        self.gamepad_button.clicked.connect(self.connect_gamepad)
+        safety_row.addWidget(self.gamepad_button)
+        safety_layout.addLayout(safety_row)
+        self.gamepad_status = QLabel("Manette inactive. D-pad: avance/recul; bouton 1: STOP (à vérifier).")
+        self.gamepad_status.setObjectName("hint")
+        self.gamepad_status.setWordWrap(True)
+        safety_layout.addWidget(self.gamepad_status)
+        body.addWidget(safety_card)
+
+        log_card, log_layout = make_card("06   Journal des événements")
         self.log = QTextEdit()
         self.log.setReadOnly(True)
         self.log.setFixedHeight(115)
@@ -275,34 +335,164 @@ class MainWindow(QMainWindow):
             raise ValueError("Saisissez la position au centième de millimètre (0.01 mm).")
         return round(value, 2)
 
+    @property
+    def real_mode(self):
+        return self.mode_selector.currentIndex() == 1
+
+    def refresh_ports(self):
+        self.port_selector.clear()
+        for name, desc in self.serial_manager.available_ports():
+            self.port_selector.addItem(f"{name} — {desc}", name)
+
+    def change_mode(self):
+        if self.motion_busy or self.pending:
+            return
+        if self.serial_manager.is_connected:
+            self.serial_manager.disconnect_port()
+        self.clear_real_position("Changement de mode")
+        self.hardware_check.setChecked(False)
+        self.badge.setText("MODE ARDUINO" if self.real_mode else "MODE SIMULATION")
+        self.update_position()
+
+    def toggle_connection(self):
+        if self.motion_busy or self.pending:
+            QMessageBox.warning(self, "Mouvement actif", "Attendez l'arrêt avant de déconnecter.")
+            return
+        if self.serial_manager.is_connected:
+            self.serial_manager.disconnect_port()
+            return
+        name = self.port_selector.currentData()
+        if not name:
+            QMessageBox.warning(self, "Port", "Aucun port série sélectionné.")
+            return
+        try:
+            self.serial_manager.connect_port(name)
+        except ConnectionError as error:
+            QMessageBox.warning(self, "Connexion", str(error))
+            return
+        self.clear_real_position("Arduino connecté : initialisation requise")
+        # USB opening generally resets Uno. Wait before requesting its position.
+        QTimer.singleShot(2200, self.query_position)
+        self.update_position()
+
+    def clear_real_position(self, reason):
+        self.arduino_initialized = False
+        self.arduino_position = None
+        self.arduino_origin = None
+        self.motion_busy = False
+        self.pending = None
+        self.log.append(reason)
+
+    def on_serial_disconnected(self):
+        self.clear_real_position("USB déconnecté : position inconnue")
+        self.update_position()
+
+    def on_serial_error(self, reason):
+        self.log.append("Erreur USB : " + reason)
+        if self.motion_busy or self.pending:
+            self.clear_real_position("Communication incertaine : nouvelle calibration requise")
+        self.update_position()
+
+    def query_position(self):
+        if self.real_mode and self.serial_manager.is_connected and not self.pending:
+            try:
+                self.serial_manager.send_command("P")
+            except ConnectionError as error:
+                self.on_serial_error(str(error))
+
+    def on_serial_message(self, line):
+        self.log.append("Arduino > " + line)
+        kind, value = parse_message(line)
+        if kind == "restarted":
+            self.clear_real_position("Arduino redémarré : calibrer avant déplacement")
+        elif kind == "unknown":
+            self.arduino_initialized = False
+            self.arduino_position = None
+            self.arduino_origin = None
+            self.pending = None
+            self.motion_busy = False
+        elif kind == "calibrated":
+            if self.pending and self.pending[0] == "calibrate":
+                self.arduino_initialized = True
+                self.arduino_origin = self.pending[1]
+                self.arduino_position = self.pending[1]
+                self.pending = None
+        elif kind == "moving":
+            self.motion_busy = True
+        elif kind in ("completed", "stopped"):
+            # Do not clear pending until position + HOLDING have been received.
+            self.motion_busy = True
+        elif kind == "position":
+            if self.arduino_initialized:
+                self.arduino_position = value
+        elif kind == "idle":
+            if self.pending and self.pending[0] == "move":
+                self.pending = None
+            self.motion_busy = False
+        elif kind == "error":
+            self.pending = None
+            self.motion_busy = False
+            if "Calibrate" in value or "calibrat" in value.lower():
+                self.arduino_initialized = False
+                self.arduino_position = None
+        self.update_position()
+
+    def send_real(self, command, pending=None):
+        try:
+            self.serial_manager.send_command(command)
+        except ConnectionError as error:
+            self.on_serial_error(str(error))
+            return False
+        self.pending = pending
+        self.log.append("PC > " + command)
+        self.update_position()
+        return True
+
     def initialize_motor(self):
         try:
             position = self.parse_position(self.initial_input)
         except ValueError as error:
             QMessageBox.warning(self, "Position invalide", str(error))
             return
-        if self.motor.is_initialized:
-            choice = QMessageBox.question(
-                self, "Réinitialisation", "Remplacer la position de référence actuelle?"
-            )
-            if choice != QMessageBox.StandardButton.Yes:
+        if self.real_mode:
+            if not self.serial_manager.is_connected or not self.hardware_check.isChecked():
+                QMessageBox.warning(self, "Sécurité", "Connectez Arduino et vérifiez sa configuration et les limites sûres.")
                 return
-        try:
-            self.motor.initialize(position)
-        except ValueError as error:
-            QMessageBox.warning(self, "Erreur", str(error))
+            if self.pending or self.motion_busy:
+                QMessageBox.warning(self, "Occupé", "Attendez la fin de la commande précédente.")
+                return
+            if self.arduino_initialized and QMessageBox.question(
+                self, "Réinitialisation", "La lecture physique a-t-elle été vérifiée ? Remplacer la référence ?"
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.arduino_initialized = False
+            self.send_real(f"C {position:.2f}", ("calibrate", position))
             return
-        self.log.append(f"Initialisation : {position:.2f} mm")
+        if self.motor.is_initialized and QMessageBox.question(
+            self, "Réinitialisation", "Remplacer la position de référence actuelle ?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.motor.initialize(position)
+        self.log.append(f"SIM > Initialisation : {position:.2f} mm")
         self.update_position()
 
     def move_relative(self, direction):
         distance = float(self.step_selector.currentText()) * direction
+        if self.real_mode:
+            if not self.is_ready_for_motion():
+                return
+            target = self.arduino_position + distance
+            if not MIN_POSITION_MM <= target <= MAX_POSITION_MM:
+                QMessageBox.warning(self, "Limites", "Mouvement hors de la plage configurée.")
+                return
+            self.send_real(f"M {distance:.2f}", ("move", target))
+            return
         try:
             steps = self.motor.move_relative(distance)
         except ValueError as error:
             QMessageBox.warning(self, "Erreur", str(error))
             return
-        self.log.append(f"REL  {distance:+.2f} mm  |  {steps:+d} impulsions")
+        self.log.append(f"SIM REL {distance:+.2f} mm | {steps:+d} impulsions")
         self.update_position()
 
     def move_absolute(self):
@@ -311,36 +501,109 @@ class MainWindow(QMainWindow):
         except ValueError as error:
             QMessageBox.warning(self, "Position invalide", str(error))
             return
+        if self.real_mode:
+            if not self.is_ready_for_motion():
+                return
+            self.send_real(f"G {target:.2f}", ("move", target))
+            return
         try:
             steps = self.motor.move_absolute(target)
         except ValueError as error:
             QMessageBox.warning(self, "Erreur", str(error))
             return
-        self.log.append(f"ABS  {target:.2f} mm  |  {steps:+d} impulsions")
+        self.log.append(f"SIM ABS {target:.2f} mm | {steps:+d} impulsions")
         self.update_position()
 
-    def update_position(self):
-        ready = self.motor.is_initialized
-        self.forward_button.setEnabled(ready)
-        self.backward_button.setEnabled(ready)
-        self.move_button.setEnabled(ready)
-        if not ready:
+    def is_ready_for_motion(self):
+        if not (self.serial_manager.is_connected and self.hardware_check.isChecked()
+                and self.arduino_initialized and self.arduino_position is not None
+                and not self.motion_busy and not self.pending):
+            self.log.append("Commande refusée : vérifier connexion, calibration et disponibilité.")
+            return False
+        return True
+
+    def stop_motion(self):
+        if self.real_mode and self.serial_manager.is_connected:
+            # STOP remains available even during a pending movement.
+            self.send_real("STOP", self.pending)
+        elif not self.real_mode:
+            self.log.append("Simulation : aucun mouvement en cours.")
+
+    def connect_gamepad(self):
+        if self.gamepad is None:
+            try:
+                self.gamepad = GamepadController(self)
+            except Exception as error:
+                QMessageBox.warning(self, "Manette", str(error))
+                return
+            self.gamepad.move_requested.connect(self.move_relative)
+            self.gamepad.stop_requested.connect(self.stop_motion)
+            self.gamepad.status_changed.connect(self.gamepad_status.setText)
+        self.gamepad.connect_gamepad()
+
+    def update_position(self, *_):
+        if self.real_mode:
+            connected = self.serial_manager.is_connected
+            ready = (connected and self.hardware_check.isChecked()
+                     and self.arduino_initialized and self.arduino_position is not None)
+            idle = ready and not self.motion_busy and not self.pending
+            position = self.arduino_position if ready else None
+            origin = self.arduino_origin
+            self.port_selector.setEnabled(not connected)
+            self.refresh_button.setEnabled(not connected)
+            self.connection_button.setText("Déconnecter" if connected else "Connecter")
+            self.usb_status.setText("USB connecté" if connected else "USB déconnecté")
+            self.init_button.setEnabled(connected and self.hardware_check.isChecked()
+                                        and not self.motion_busy and not self.pending)
+            self.stop_button.setEnabled(connected)
+        else:
+            ready = self.motor.is_initialized
+            idle = ready
+            position = self.motor.current_position
+            origin = self.motor.initial_position
+            self.port_selector.setEnabled(False)
+            self.refresh_button.setEnabled(False)
+            self.connection_button.setEnabled(False)
+            self.usb_status.setText("Simulation : aucun mouvement physique")
+            self.init_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+        if self.real_mode:
+            self.connection_button.setEnabled(True)
+        self.mode_selector.setEnabled(not self.motion_busy and not self.pending)
+        if self.real_mode:
+            self.connection_button.setEnabled(not self.motion_busy and not self.pending)
+        self.forward_button.setEnabled(idle)
+        self.backward_button.setEnabled(idle)
+        self.move_button.setEnabled(idle)
+        if position is None:
             self.position_label.setText("— mm")
             self.displacement_label.setText("Déplacement depuis l'initialisation : —")
-            self.status_label.setText("●  En attente d'initialisation")
-            self.status_label.setStyleSheet("color: #945b13;")
             self.position_bar.setValue(0)
-            return
-        position = self.motor.current_position
-        displacement = position - self.motor.initial_position
-        self.position_label.setText(f"{position:.4f} mm")
-        self.displacement_label.setText(
-            f"Déplacement depuis l'initialisation : {displacement:+.4f} mm"
+        else:
+            self.position_label.setText(f"{position:.4f} mm")
+            self.displacement_label.setText(
+                f"Déplacement depuis l'initialisation : {position-origin:+.4f} mm"
+                if origin is not None else "Déplacement depuis l'initialisation : —"
+            )
+            fraction = (position - MIN_POSITION_MM) / (MAX_POSITION_MM - MIN_POSITION_MM)
+            self.position_bar.setValue(max(0, min(1000, round(fraction * 1000))))
+        label = ("●  Mouvement en cours" if self.motion_busy else
+                 "●  Prêt à déplacer" if ready else "●  Initialisation requise")
+        self.status_label.setText(label)
+        self.status_label.setStyleSheet(
+            "color: #18835e;" if ready and not self.motion_busy else "color: #945b13;"
         )
-        self.status_label.setText("●  Prêt à déplacer (simulation)")
-        self.status_label.setStyleSheet("color: #18835e;")
-        fraction = (position - MIN_POSITION_MM) / (MAX_POSITION_MM - MIN_POSITION_MM)
-        self.position_bar.setValue(max(0, min(1000, round(fraction * 1000))))
+
+    def closeEvent(self, event):
+        if self.real_mode and self.serial_manager.is_connected and self.motion_busy:
+            QMessageBox.warning(self, "Mouvement actif",
+                                "Arrêtez le moteur et attendez sa confirmation avant de fermer.")
+            event.ignore()
+            return
+        if self.gamepad is not None:
+            self.gamepad.close()
+        self.serial_manager.disconnect_port()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":
