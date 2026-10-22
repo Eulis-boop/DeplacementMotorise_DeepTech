@@ -1,0 +1,70 @@
+name: Build desktop applications
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: macos-15
+            label: macos-intel
+          - os: macos-15-arm64
+            label: macos-apple-silicon
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install runtime and build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Verify Python syntax
+        run: |
+          python -m py_compile main.py gamepad_controller.py serial_manager.py arduino_protocol.py motor_config.py motor_controller.py plate_config_dialog.py
+
+      - name: Build desktop app
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name DeepTechController --collect-all pygame main.py
+
+      - name: Package macOS application
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent dist/DeepTechController.app "release/DeepTechController-${{ matrix.label }}.zip"
+
+      - name: Package Windows/Linux application
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir -p release
+          python -c 'import shutil; shutil.make_archive("release/DeepTechController-${{ matrix.label }}", "zip", root_dir="dist", base_dir="DeepTechController")'
+
+      - name: Upload downloadable application
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepTechController-${{ matrix.label }}
+          path: release/*.zip
+          if-no-files-found: error
