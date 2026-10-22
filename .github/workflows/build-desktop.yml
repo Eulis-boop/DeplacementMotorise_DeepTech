@@ -17,25 +17,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
+          - os: windows-2022
             label: windows-x64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             label: linux-x64
-          - os: macos-15
+          - os: ubuntu-24.04-arm
+            label: linux-arm64
+          - os: macos-15-intel
             label: macos-intel
-          - os: macos-15-arm64
+          - os: macos-15
             label: macos-apple-silicon
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.12'
 
-      - name: Install runtime and build dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
@@ -44,27 +46,44 @@ jobs:
         run: |
           python -m py_compile main.py gamepad_controller.py serial_manager.py arduino_protocol.py motor_config.py motor_controller.py plate_config_dialog.py
 
-      - name: Build desktop app
+      - name: Build one executable on Windows and Linux
+        if: runner.os != 'macOS'
+        run: |
+          python -m PyInstaller --noconfirm --clean --windowed --onefile --name Deplacement_Motorise_DeepTech --collect-all pygame main.py
+
+      - name: Build macOS app bundle
+        if: runner.os == 'macOS'
         run: |
           python -m PyInstaller --noconfirm --clean --windowed --onedir --name Deplacement_Motorise_DeepTech --collect-all pygame main.py
 
-      - name: Package macOS application
+      - name: Package Windows executable
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          test -f dist/Deplacement_Motorise_DeepTech.exe
+          mkdir -p release
+          python -c 'import shutil; shutil.make_archive("release/Deplacement_Motorise_DeepTech-${{ matrix.label }}", "zip", root_dir="dist", base_dir="Deplacement_Motorise_DeepTech.exe")'
+
+      - name: Package Linux executable with executable permissions
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          test -x dist/Deplacement_Motorise_DeepTech
+          file dist/Deplacement_Motorise_DeepTech
+          mkdir -p release
+          tar -czf "release/Deplacement_Motorise_DeepTech-${{ matrix.label }}.tar.gz" -C dist Deplacement_Motorise_DeepTech
+
+      - name: Package macOS app bundle
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          test -d dist/Deplacement_Motorise_DeepTech.app
           mkdir -p release
           ditto -c -k --sequesterRsrc --keepParent dist/Deplacement_Motorise_DeepTech.app "release/Deplacement_Motorise_DeepTech-${{ matrix.label }}.zip"
 
-      - name: Package Windows/Linux application
-        if: runner.os != 'macOS'
-        shell: bash
-        run: |
-          mkdir -p release
-          python -c 'import shutil; shutil.make_archive("release/Deplacement_Motorise_DeepTech-${{ matrix.label }}", "zip", root_dir="dist", base_dir="Deplacement_Motorise_DeepTech")'
-
-      - name: Upload downloadable application
-        uses: actions/upload-artifact@v4
+      - name: Upload application package
+        uses: actions/upload-artifact@v6
         with:
           name: Deplacement_Motorise_DeepTech-${{ matrix.label }}
-          path: release/*.zip
+          path: release/*
           if-no-files-found: error
