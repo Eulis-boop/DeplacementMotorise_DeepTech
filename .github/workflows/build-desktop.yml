@@ -46,25 +46,25 @@ jobs:
 
       - name: Build desktop app
         run: |
-          python -m PyInstaller --noconfirm --clean --windowed --onedir --name DeepTechController --collect-all pygame main.py
+          python -m PyInstaller --noconfirm --clean --windowed --onedir --name Deplacement_Motorise_DeepTech --collect-all pygame main.py
 
       - name: Package macOS application
         if: runner.os == 'macOS'
         shell: bash
         run: |
           mkdir -p release
-          ditto -c -k --sequesterRsrc --keepParent dist/DeepTechController.app "release/DeepTechController-${{ matrix.label }}.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/Deplacement_Motorise_DeepTech.app "release/Deplacement_Motorise_DeepTech-${{ matrix.label }}.zip"
 
       - name: Package Windows/Linux application
         if: runner.os != 'macOS'
         shell: bash
         run: |
           mkdir -p release
-          python -c 'import shutil; shutil.make_archive("release/DeepTechController-${{ matrix.label }}", "zip", root_dir="dist", base_dir="DeepTechController")'
+          python -c 'import shutil; shutil.make_archive("release/Deplacement_Motorise_DeepTech-${{ matrix.label }}", "zip", root_dir="dist", base_dir="Deplacement_Motorise_DeepTech")'
 
       - name: Upload downloadable application
         uses: actions/upload-artifact@v4
         with:
-          name: DeepTechController-${{ matrix.label }}
+          name: Deplacement_Motorise_DeepTech-${{ matrix.label }}
           path: release/*.zip
           if-no-files-found: error
