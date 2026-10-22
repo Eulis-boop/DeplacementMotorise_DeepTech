@@ -1,3 +1,9 @@
+"""Step-quantized motion model used ONLY in simulation mode.
+
+Real position tracking is handled by the Arduino firmware and its responses;
+this class cannot measure the true physical stage position.
+"""
+
 from motor_config import (
     STEPS_PER_MM,
     MIN_POSITION_MM,
@@ -5,7 +11,9 @@ from motor_config import (
 )
 
 class MotionController:
+    """Track a simulated position as an integer count of STEP pulses."""
     def __init__(self):
+        """Create a simulator with no position reference yet."""
         self.initial_position = None
         self.current_steps = 0
 
@@ -22,14 +30,16 @@ class MotionController:
             self.initial_position + self.current_steps / STEPS_PER_MM
         )
 
-    def initialize(self, position_mm):
+    def initialize(self, position_mm: float) -> None:
+        """Set a manually observed reference without executing movement."""
         if not MIN_POSITION_MM <= position_mm <= MAX_POSITION_MM:
             raise ValueError("Initial position out of limits.")
 
         self.initial_position = position_mm
         self.current_steps = 0
 
-    def move_relative(self, distance_mm):
+    def move_relative(self, distance_mm: float) -> int:
+        """Simulate a signed movement in millimeters and return pulse count."""
         if not self.is_initialized:
             raise ValueError("Initialise the position.")
 
@@ -46,13 +56,16 @@ class MotionController:
         self.current_steps = new_steps
         return steps
 
-    def move_absolute(self, target_mm):
+    def move_absolute(self, target_mm: float) -> int:
+        """Simulate a target reading, returning signed pulses executed."""
         if not self.is_initialized:
             raise ValueError("Initialise the position.")
 
         if not MIN_POSITION_MM <= target_mm <= MAX_POSITION_MM:
             raise ValueError("Out-of-limits target position.")
 
+        # Quantize the target relative to the initial reference to avoid
+        # accumulating independent floating-point rounding errors.
         target_steps = round(
             (target_mm - self.initial_position) * STEPS_PER_MM
         )
