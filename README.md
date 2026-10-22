@@ -2,7 +2,6 @@
 
 **Course:** Développement des produits technologiques "DeepTech"  
 **Project:** Déplacement motorisé  
-**Team 5:** CASTILLO TURRUBIARTES Eunice Saraí, LIU Binhao, WANG Qia, and LEI Yumian.
 
 ## Overview
 
@@ -164,18 +163,13 @@ Common firmware responses include `Calibration accepted.`, `Moving to ...`, `Tar
 - Arduino and Python may lose synchronization if the motor stalls, is manually moved, or reconnects during motion. Re-establish a physical reference when uncertain.
 - GUI software limits and the confirmation checkbox are not a hardware-rated safety interlock.
 
-## Tests and validation
+## Authors
+- **Team 5:** 
+        - CASTILLO TURRUBIARTES Eunice Saraí
+        - LIU Binhao
+        - WANG Qia
+        - LEI Yumian
+  École Centrale de Lille
+- **M. Simon BOUVEL**
+  École Centrale de Lille
 
-Run non-hardware Python tests with:
-
-```bash
-python -m unittest discover -s tests -v
-```
-
-Recommended physical validation: command multiple target readings; measure displacement using an independent calibrated instrument; record signed positioning error, maximum absolute error, bidirectional repeatability, and backlash effects. Keep the test's actual results separate from theoretical command resolution.
-
-## Development status
-
-- Implemented: simulator, GUI, line-based Arduino USB transport, initial/relative/absolute commands, STOP request handling, incremental BEITONG trigger input.
-- Verified in code: Python syntax, simulator/protocol tests (see tests directory).
-- Needs hardware/platform validation: firmware EEPROM and travel limits, missed-step effects, recovery from USB loss, reliable gamepad connection, Windows and Linux GUI/USB/controller behavior, physical positioning accuracy and repeatability.
