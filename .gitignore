@@ -11,3 +11,7 @@ venv/
 
 # Environment variables
 .env
+
+# Local gamepad diagnostics
+diagnostic_sticks.py
+test_gamepad.py
