@@ -1,8 +1,8 @@
 # DeepTech — Motorized Micrometric Translation Stage
 
-**Course:** Développement des produits technologiques DeepTech  
+**Course:** Développement des produits technologiques "DeepTech"  
 **Project:** Déplacement motorisé  
-**Status:** Research/teaching prototype; hardware performance and cross-platform builds require validation.
+**Team 5:** CASTILLO TURRUBIARTES Eunice Saraí, LIU Binhao, WANG Qia, and LEI Yumian.
 
 ## Overview
 
