@@ -10,7 +10,6 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
-    QCheckBox,
     QLineEdit,
     QFrame,
     QGridLayout,
@@ -31,6 +30,7 @@ from motor_controller import MotionController
 from serial_manager import SerialManager
 from arduino_protocol import parse_message
 from gamepad_controller import GamepadController
+from plate_config_dialog import PlateConfigDialog, FIELDS
 
 
 STYLE = """
@@ -137,6 +137,21 @@ class MainWindow(QMainWindow):
         self.motion_busy = False
         self.pending = None
         self.gamepad = None
+        self.plate_dialog = None
+        self.plate_config = {}
+        self.config_loaded = False
+        self.config_reading = False
+        self.config_wizard = None  # None or list of seven submitted values.
+        self.config_wizard_index = 0
+        self.config_timeout = QTimer(self)
+        self.config_timeout.setSingleShot(True)
+        self.config_timeout.timeout.connect(self._config_timed_out)
+        self.read_timeout = QTimer(self)
+        self.read_timeout.setSingleShot(True)
+        self.read_timeout.timeout.connect(self._config_read_timed_out)
+        self.config_not_ready = False
+        self.stage_min_mm = MIN_POSITION_MM
+        self.stage_max_mm = MAX_POSITION_MM
         self.desired_jog = ""
         self.active_jog = ""
         self.jog_stopping = False
@@ -195,12 +210,13 @@ class MainWindow(QMainWindow):
         self.connection_button.clicked.connect(self.toggle_connection)
         usb_row.addWidget(self.connection_button)
         usb_layout.addLayout(usb_row)
-        self.hardware_check = QCheckBox(
-            "Configuration Arduino vérifiée (pitch 0,5 mm/tour, course sûre, micro-pas et sens)"
-        )
-        self.hardware_check.setChecked(False)
-        self.hardware_check.stateChanged.connect(self.update_position)
-        usb_layout.addWidget(self.hardware_check)
+        self.plate_button = QPushButton("Configurer la platine…")
+        self.plate_button.clicked.connect(self.open_plate_configuration)
+        usb_layout.addWidget(self.plate_button)
+        self.config_summary = QLabel("Configuration Arduino non lue.")
+        self.config_summary.setObjectName("hint")
+        self.config_summary.setWordWrap(True)
+        usb_layout.addWidget(self.config_summary)
         self.usb_status = QLabel("Mode simulation. Aucun moteur réel commandé.")
         self.usb_status.setObjectName("hint")
         usb_layout.addWidget(self.usb_status)
@@ -245,6 +261,8 @@ class MainWindow(QMainWindow):
         extent = QHBoxLayout()
         low = QLabel(f"{MIN_POSITION_MM:.1f} mm")
         high = QLabel(f"{MAX_POSITION_MM:.1f} mm")
+        self.lower_bound_label = low
+        self.upper_bound_label = high
         low.setObjectName("hint")
         high.setObjectName("hint")
         extent.addWidget(low)
@@ -338,10 +356,12 @@ class MainWindow(QMainWindow):
         import math
         if not math.isfinite(value):
             raise ValueError("La position doit être un nombre fini.")
-        if not MIN_POSITION_MM <= value <= MAX_POSITION_MM:
+        minimum = self.stage_min_mm if self.real_mode else MIN_POSITION_MM
+        maximum = self.stage_max_mm if self.real_mode else MAX_POSITION_MM
+        if not minimum <= value <= maximum:
             raise ValueError(
-                f"La position doit être comprise entre {MIN_POSITION_MM:.2f} "
-                f"et {MAX_POSITION_MM:.2f} mm."
+                f"La position doit être comprise entre {minimum:.2f} "
+                f"et {maximum:.2f} mm."
             )
         if abs(value * 100 - round(value * 100)) > 1e-7:
             raise ValueError("Saisissez la position au centième de millimètre (0.01 mm).")
@@ -366,7 +386,6 @@ class MainWindow(QMainWindow):
         if self.serial_manager.is_connected:
             self.serial_manager.disconnect_port()
         self.clear_real_position("Changement de mode")
-        self.hardware_check.setChecked(False)
         self.badge.setText("MODE ARDUINO" if self.real_mode else "MODE SIMULATION")
         self.update_position()
 
@@ -388,7 +407,10 @@ class MainWindow(QMainWindow):
             return
         self.clear_real_position("Arduino connecté : initialisation requise")
         # USB opening generally resets Uno. Wait before requesting its position.
-        QTimer.singleShot(2200, self.query_position)
+        # Uno generally resets when the port opens; query effective EEPROM
+        # settings only after its startup sequence has completed.
+        QTimer.singleShot(2200, self.read_plate_config)
+        QTimer.singleShot(2350, self.query_position)
         self.update_position()
 
     def clear_real_position(self, reason):
@@ -397,6 +419,14 @@ class MainWindow(QMainWindow):
         self.arduino_origin = None
         self.motion_busy = False
         self.pending = None
+        self.config_loaded = False
+        self.config_reading = False
+        self.config_not_ready = False
+        self.plate_config = {}
+        self.read_timeout.stop()
+        self.config_timeout.stop()
+        self.config_wizard = None
+        self.config_summary.setText("Configuration Arduino non lue.")
         self.desired_jog = ""
         self.active_jog = ""
         self.jog_stopping = False
@@ -423,6 +453,18 @@ class MainWindow(QMainWindow):
     def on_serial_message(self, line):
         """Synchronize motor state with the firmware's textual responses."""
         self.log.append("Arduino > " + line)
+        # Configuration traffic belongs to a separate, acknowledgement-driven
+        # protocol. Do not confuse its prompts with motion status messages.
+        if self._handle_config_line(line):
+            self.update_position()
+            return
+        if self.config_reading and (
+            line.startswith("Unknown command") or line.startswith("Complete SETUP")
+        ):
+            self.log.append(
+                "Firmware non compatible avec CONFIG ou assistant SETUP déjà actif. "
+                "Vérifiez le .ino chargé dans la carte."
+            )
         kind, value = parse_message(line)
         if line == "Continuous motion stopped at software travel limit.":
             # Do not automatically restart into the same end stop.
@@ -439,7 +481,14 @@ class MainWindow(QMainWindow):
         if kind == "restarted":
             self.clear_real_position("Arduino redémarré : calibrer avant déplacement")
         elif kind == "unknown":
-            self.clear_real_position("Position inconnue : calibration requise")
+            # An uncalibrated physical position does not invalidate EEPROM
+            # configuration already verified by CONFIG.
+            self.arduino_initialized = False
+            self.arduino_position = None
+            self.arduino_origin = None
+            self.pending = None
+            self.motion_busy = False
+            self.log.append("Position inconnue : calibration requise")
         elif kind == "calibrated":
             if self.pending and self.pending[0] == "calibrate":
                 self.arduino_initialized = True
@@ -483,6 +532,212 @@ class MainWindow(QMainWindow):
                 self.arduino_initialized = False
                 self.arduino_position = None
         self.update_position()
+
+    def open_plate_configuration(self):
+        """Open mechanical configuration only while the controller is idle."""
+        if not (self.real_mode and self.serial_manager.is_connected
+                and not self.motion_busy and not self.pending
+                and self.config_wizard is None):
+            QMessageBox.warning(self, "Configuration", "Arrêtez le moteur et connectez Arduino.")
+            return
+        self.plate_dialog = PlateConfigDialog(self)
+        if not (self.config_loaded or self.config_not_ready):
+            self.plate_dialog.status.setText(
+                "Valeurs par défaut — non lues depuis Arduino."
+            )
+        if self.config_loaded:
+            self.plate_dialog.populate(self.plate_config)
+        self.plate_dialog.read_button.clicked.connect(self.read_plate_config)
+        self.plate_dialog.save_button.clicked.connect(self.start_plate_setup)
+        if not self.config_loaded and not self.config_reading:
+            self.read_plate_config()
+        self.plate_dialog.exec()
+        self.plate_dialog = None
+
+    def read_plate_config(self):
+        """Request actual EEPROM parameters rather than assuming source defaults."""
+        if not (self.real_mode and self.serial_manager.is_connected) or self.config_wizard is not None:
+            return
+        if self.motion_busy or self.pending:
+            if self.plate_dialog is not None:
+                self.plate_dialog.status.setText(
+                    "Lecture impossible : attendez la fin du mouvement."
+                )
+            return
+        if self.config_reading:
+            if self.plate_dialog is not None:
+                self.plate_dialog.status.setText(
+                    "Lecture en cours : attente de la réponse CONFIG d'Arduino…"
+                )
+            return
+        self.config_loaded = False
+        self.config_not_ready = False
+        self.config_reading = True
+        self.plate_config = {}
+        self.config_summary.setText("Lecture de la configuration Arduino en cours…")
+        if self.plate_dialog is not None:
+            self.plate_dialog.status.setText(
+                "Lecture en cours…"
+            )
+        self.read_timeout.start(5000)
+        try:
+            self.serial_manager.send_command("CONFIG")
+            self.log.append("PC > CONFIG")
+        except ConnectionError as error:
+            self.config_reading = False
+            self.on_serial_error(str(error))
+        self.update_position()
+
+    def start_plate_setup(self):
+        """Launch the seven-field Arduino wizard; never burst values blindly."""
+        if self.plate_dialog is None:
+            return
+        if self.config_reading:
+            QMessageBox.information(
+                self, "Configuration",
+                "Lecture CONFIG en cours. Attendez la réponse d'Arduino."
+            )
+            return
+        if not (self.config_loaded or self.config_not_ready):
+            QMessageBox.warning(
+                self, "Configuration non disponible",
+                "Impossible de lire CONFIG. Vérifiez le firmware et reconnectez Arduino."
+            )
+            return
+        if self.motion_busy or self.pending or self.config_wizard is not None:
+            return
+        try:
+            values = self.plate_dialog.values()
+        except ValueError as error:
+            QMessageBox.warning(self, "Configuration invalide", str(error))
+            return
+        decision = QMessageBox.question(
+            self, "Écrire dans EEPROM",
+            "Enregistrer ces paramètres sur Arduino ? Une nouvelle calibration sera nécessaire."
+        )
+        if decision != QMessageBox.StandardButton.Yes:
+            return
+        self.config_wizard = values
+        self.config_wizard_index = 0
+        self.config_loaded = False
+        self.config_not_ready = False
+        self.read_timeout.stop()
+        self.arduino_initialized = False
+        self.arduino_position = None
+        self.arduino_origin = None
+        self.desired_jog = ""
+        self.active_jog = ""
+        self.jog_timer.stop()
+        self.plate_dialog.set_busy(True)
+        try:
+            self.serial_manager.send_command("SETUP")
+            self.log.append("PC > SETUP")
+            self.config_timeout.start(5000)
+        except ConnectionError as error:
+            self.on_serial_error(str(error))
+            self._config_timed_out()
+        self.update_position()
+
+    def _config_read_timed_out(self):
+        """Do not trust a partial or unsupported CONFIG response."""
+        if self.config_reading:
+            self.config_reading = False
+            self.config_loaded = False
+            self.log.append("CONFIG sans réponse complète : firmware CONFIG incompatible, port incorrect ou Arduino occupé.")
+            self.config_summary.setText("CONFIG indisponible — aucun paramètre EEPROM vérifié.")
+            if self.plate_dialog:
+                self.plate_dialog.status.setText(
+                    "Lecture impossible. Vérifiez la connexion et le firmware."
+                )
+            self.update_position()
+
+    def _config_timed_out(self):
+        """Fail closed after a missing prompt; reconnect to reset wizard mode."""
+        self.config_loaded = False
+        self.config_reading = False
+        self.config_wizard = None
+        self.log.append("SETUP interrompu : réponse manquante. Reconnectez Arduino avant de reprendre.")
+        if self.plate_dialog:
+            self.plate_dialog.set_busy(False)
+            self.plate_dialog.status.setText("Échec SETUP. Fermez et reconnectez Arduino.")
+            self.plate_dialog.save_button.setEnabled(False)
+        self.update_position()
+
+    def _handle_config_line(self, line):
+        """Consume CONFIG records or wizard prompts before the motion parser."""
+        if line.startswith("CONFIG "):
+            parts = line.split()
+            if len(parts) == 3 and parts[1] in {k for k, _, _ in FIELDS}:
+                try:
+                    self.plate_config[parts[1]] = float(parts[2])
+                except ValueError:
+                    self.config_reading = False
+                return True
+            if line == "CONFIG END":
+                if len(self.plate_config) == 7:
+                    try:
+                        from plate_config_dialog import validate_config
+                        validate_config([self.plate_config[k] for k, _, _ in FIELDS])
+                    except ValueError:
+                        self.config_loaded = False
+                    else:
+                        self.config_loaded = True
+                        self.stage_min_mm = self.plate_config["MIN_MM"]
+                        self.stage_max_mm = self.plate_config["MAX_MM"]
+                        self.config_summary.setText(
+                            f"Arduino : {self.stage_min_mm:.3f} à {self.stage_max_mm:.3f} mm · "
+                            f"avance {self.plate_config['PITCH_MM']:.3f} mm/tr"
+                        )
+                        if self.plate_dialog:
+                            self.plate_dialog.populate(self.plate_config)
+                        self.log.append("Configuration EEPROM confirmée (CONFIG END).")
+                self.config_reading = False
+                self.read_timeout.stop()
+                return True
+            if line == "CONFIG ERROR NOT_READY":
+                self.config_reading = False
+                self.read_timeout.stop()
+                self.config_loaded = False
+                self.config_not_ready = True
+                self.config_summary.setText("Aucune configuration EEPROM valide ; SETUP requis.")
+                if self.plate_dialog:
+                    self.plate_dialog.status.setText("Aucun réglage enregistré. Saisissez les paramètres.")
+                return True
+        if self.config_wizard is None:
+            return False
+        import re
+        prompt = re.match(r"^([1-7])/7 ", line)
+        if prompt:
+            expected = self.config_wizard_index + 1
+            if int(prompt.group(1)) != expected:
+                self._config_timed_out()
+                return True
+            value = self.config_wizard[self.config_wizard_index]
+            formatted = str(int(value)) if expected == 7 else f"{value:.6f}"
+            self.config_wizard_index += 1
+            try:
+                self.serial_manager.send_command(formatted)
+                self.log.append(f"SETUP {expected}/7 > {formatted}")
+            except ConnectionError as error:
+                self.on_serial_error(str(error))
+                self._config_timed_out()
+                return True
+            self.config_timeout.start(5000)
+            return True
+        if line == "Configuration saved to EEPROM.":
+            self.config_timeout.stop()
+            self.config_wizard = None
+            self.config_wizard_index = 0
+            if self.plate_dialog:
+                self.plate_dialog.set_busy(False)
+                self.plate_dialog.status.setText("Enregistré ! Relecture EEPROM et calibrage requis.")
+            self.read_plate_config()
+            return True
+        if (line.startswith("Invalid") or line.startswith("ERROR:")
+                or line.startswith("Please re-enter") or line.startswith("Direction must")):
+            self._config_timed_out()
+            return True
+        return True  # Setup status text must not modify the motion state.
 
     def _issue_unconditional_stop(self, reason: str) -> None:
         """Send STOP even when the GUI incorrectly believes the motor is idle.
@@ -580,8 +835,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Position invalide", str(error))
             return
         if self.real_mode:
-            if not self.serial_manager.is_connected or not self.hardware_check.isChecked():
-                QMessageBox.warning(self, "Sécurité", "Connectez Arduino et vérifiez sa configuration et les limites sûres.")
+            if not self.serial_manager.is_connected or not self.config_loaded:
+                QMessageBox.warning(self, "Configuration", "Connectez Arduino et chargez une configuration valide.")
                 return
             if self.pending or self.motion_busy:
                 QMessageBox.warning(self, "Occupé", "Attendez la fin de la commande précédente.")
@@ -612,7 +867,7 @@ class MainWindow(QMainWindow):
             if not self.is_ready_for_motion():
                 return
             target = self.arduino_position + distance
-            if not MIN_POSITION_MM <= target <= MAX_POSITION_MM:
+            if not self.stage_min_mm <= target <= self.stage_max_mm:
                 QMessageBox.warning(self, "Limites", "Mouvement hors de la plage configurée.")
                 return
             self.send_real(f"M {distance:.2f}", ("move", target))
@@ -645,8 +900,9 @@ class MainWindow(QMainWindow):
         self.update_position()
 
     def is_ready_for_motion(self):
-        if not (self.serial_manager.is_connected and self.hardware_check.isChecked()
+        if not (self.serial_manager.is_connected and self.config_loaded
                 and self.arduino_initialized and self.arduino_position is not None
+                and self.config_loaded and self.config_wizard is None
                 and not self.motion_busy and not self.pending):
             self.log.append("Commande refusée : vérifier connexion, calibration et disponibilité.")
             return False
@@ -674,7 +930,7 @@ class MainWindow(QMainWindow):
     def update_position(self, *_):
         if self.real_mode:
             connected = self.serial_manager.is_connected
-            ready = (connected and self.hardware_check.isChecked()
+            ready = (connected and self.config_loaded and self.config_wizard is None
                      and self.arduino_initialized and self.arduino_position is not None)
             idle = ready and not self.motion_busy and not self.pending
             position = self.arduino_position if ready else None
@@ -683,7 +939,8 @@ class MainWindow(QMainWindow):
             self.refresh_button.setEnabled(not connected)
             self.connection_button.setText("Déconnecter" if connected else "Connecter")
             self.usb_status.setText("USB connecté" if connected else "USB déconnecté")
-            self.init_button.setEnabled(connected and self.hardware_check.isChecked()
+            self.init_button.setEnabled(connected and self.config_loaded
+                                        and self.config_wizard is None
                                         and not self.motion_busy and not self.pending)
             self.stop_button.setEnabled(connected)
         else:
@@ -699,9 +956,16 @@ class MainWindow(QMainWindow):
             self.stop_button.setEnabled(False)
         if self.real_mode:
             self.connection_button.setEnabled(True)
-        self.mode_selector.setEnabled(not self.motion_busy and not self.pending)
+        self.plate_button.setEnabled(
+            self.real_mode and self.serial_manager.is_connected
+            and not self.motion_busy and not self.pending
+            and self.config_wizard is None and not self.config_reading
+        )
+        self.mode_selector.setEnabled(not self.motion_busy and not self.pending
+                                     and self.config_wizard is None)
         if self.real_mode:
-            self.connection_button.setEnabled(not self.motion_busy and not self.pending)
+            self.connection_button.setEnabled(not self.motion_busy and not self.pending
+                                              and self.config_wizard is None)
         self.forward_button.setEnabled(idle)
         self.backward_button.setEnabled(idle)
         self.move_button.setEnabled(idle)
@@ -715,8 +979,14 @@ class MainWindow(QMainWindow):
                 f"Déplacement depuis l'initialisation : {position-origin:+.4f} mm"
                 if origin is not None else "Déplacement depuis l'initialisation : —"
             )
-            fraction = (position - MIN_POSITION_MM) / (MAX_POSITION_MM - MIN_POSITION_MM)
+            minimum = self.stage_min_mm if self.real_mode else MIN_POSITION_MM
+            maximum = self.stage_max_mm if self.real_mode else MAX_POSITION_MM
+            fraction = (position - minimum) / (maximum - minimum)
             self.position_bar.setValue(max(0, min(1000, round(fraction * 1000))))
+        minimum = self.stage_min_mm if self.real_mode else MIN_POSITION_MM
+        maximum = self.stage_max_mm if self.real_mode else MAX_POSITION_MM
+        self.lower_bound_label.setText(f"{minimum:.2f} mm")
+        self.upper_bound_label.setText(f"{maximum:.2f} mm")
         label = ("●  Mouvement en cours" if self.motion_busy else
                  "●  Prêt à déplacer" if ready else "●  Initialisation requise")
         self.status_label.setText(label)
@@ -726,6 +996,10 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Avoid closing during a known active motion and release resources."""
+        if self.config_wizard is not None:
+            QMessageBox.warning(self, "Configuration", "Terminez SETUP ou reconnectez Arduino avant de fermer.")
+            event.ignore()
+            return
         if self.real_mode and self.serial_manager.is_connected and (self.motion_busy or self.pending):
             QMessageBox.warning(self, "Mouvement actif",
                                 "Arrêtez le moteur et attendez sa confirmation avant de fermer.")

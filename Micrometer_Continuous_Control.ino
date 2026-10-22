@@ -303,6 +303,23 @@ void showPosition() {
   }
 }
 
+// Machine-readable EEPROM configuration for the desktop application.
+// The values below are the effective settings, not merely source defaults.
+void showConfig() {
+  if (!configReady) {
+    reply.println(F("CONFIG ERROR NOT_READY"));
+    return;
+  }
+  reply.print(F("CONFIG MIN_MM ")); reply.println(cfg.minMM, 6);
+  reply.print(F("CONFIG MAX_MM ")); reply.println(cfg.maxMM, 6);
+  reply.print(F("CONFIG DIVISION_MM ")); reply.println(cfg.divisionMM, 6);
+  reply.print(F("CONFIG PITCH_MM ")); reply.println(cfg.pitchMM, 6);
+  reply.print(F("CONFIG GEAR_RATIO ")); reply.println(cfg.gearRatio, 6);
+  reply.print(F("CONFIG JOG_MM ")); reply.println(cfg.jogMM, 6);
+  reply.print(F("CONFIG REVERSE_DIRECTION ")); reply.println(cfg.reverseDirection);
+  reply.println(F("CONFIG END"));
+}
+
 void showHelp() {
   reply.println();
   reply.println(F("=== MICROMETER CONTROLLER ==="));
@@ -329,6 +346,7 @@ void showHelp() {
   reply.println(F("P          Show estimated position"));
   reply.println(F("STOP       Decelerate and stop"));
   reply.println(F("SETUP      Configure micrometer"));
+  reply.println(F("CONFIG     Read effective EEPROM configuration"));
   reply.println(F("HELP       Show commands"));
   reply.println();
 }
@@ -732,6 +750,15 @@ void handleCommand(char *line) {
     return;
   }
 
+  if (strcmp(cmd, "CONFIG") == 0) {
+    if (arg != NULL) {
+      reply.println(F("ERROR: CONFIG takes no arguments."));
+    } else {
+      showConfig();
+    }
+    return;
+  }
+
   if (strcmp(cmd, "SETUP") == 0) {
     startWizard();
     return;
@@ -913,8 +940,11 @@ void setup() {
 
   else {
     configReady = false;
-    reply.println(F("No valid saved configuration."));
-    startWizard();
+    // Do not enter the interactive wizard automatically: doing so would
+    // interpret the GUI's CONFIG request as a wizard answer at startup.
+    // The desktop application can read CONFIG ERROR NOT_READY and explicitly
+    // launch SETUP when the operator confirms the hardware parameters.
+    reply.println(F("No valid saved configuration. Use SETUP."));
   }
 }
 
