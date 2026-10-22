@@ -137,6 +137,12 @@ class MainWindow(QMainWindow):
         self.motion_busy = False
         self.pending = None
         self.gamepad = None
+        self.desired_jog = ""
+        self.active_jog = ""
+        self.jog_stopping = False
+        self.jog_timer = QTimer(self)
+        self.jog_timer.setInterval(100)
+        self.jog_timer.timeout.connect(self._send_jog_heartbeat)
         self.setWindowTitle("DeepTech | Déplacement motorisé")
         self.resize(750, 790)
         self.setMinimumSize(570, 590)
@@ -298,7 +304,7 @@ class MainWindow(QMainWindow):
         self.gamepad_button.clicked.connect(self.connect_gamepad)
         safety_row.addWidget(self.gamepad_button)
         safety_layout.addLayout(safety_row)
-        self.gamepad_status = QLabel("Manette inactive. LT : reculer, RT : avancer, B : STOP (configuration à vérifier).")
+        self.gamepad_status = QLabel("Manette inactive. LT/RT : pas relatifs ; stick G : FAST ; stick D : SLOW ; B : STOP.")
         self.gamepad_status.setObjectName("hint")
         self.gamepad_status.setWordWrap(True)
         safety_layout.addWidget(self.gamepad_status)
@@ -391,6 +397,10 @@ class MainWindow(QMainWindow):
         self.arduino_origin = None
         self.motion_busy = False
         self.pending = None
+        self.desired_jog = ""
+        self.active_jog = ""
+        self.jog_stopping = False
+        self.jog_timer.stop()
         self.log.append(reason)
 
     def on_serial_disconnected(self):
@@ -411,17 +421,25 @@ class MainWindow(QMainWindow):
                 self.on_serial_error(str(error))
 
     def on_serial_message(self, line):
-        """Apply firmware messages without assuming that sending equals execution."""
+        """Synchronize motor state with the firmware's textual responses."""
         self.log.append("Arduino > " + line)
         kind, value = parse_message(line)
+        if line == "Continuous motion stopped at software travel limit.":
+            # Do not automatically restart into the same end stop.
+            self.desired_jog = ""
+            self.active_jog = ""
+            self.jog_timer.stop()
+            self.log.append("Software limit reached; return sticks to neutral.")
+        if line == "Continuous jog watchdog timeout.":
+            self.desired_jog = ""
+            self.active_jog = ""
+            self.jog_stopping = True
+            self.jog_timer.stop()
+            self.log.append("Watchdog: return sticks to neutral before restarting.")
         if kind == "restarted":
             self.clear_real_position("Arduino redémarré : calibrer avant déplacement")
         elif kind == "unknown":
-            self.arduino_initialized = False
-            self.arduino_position = None
-            self.arduino_origin = None
-            self.pending = None
-            self.motion_busy = False
+            self.clear_real_position("Position inconnue : calibration requise")
         elif kind == "calibrated":
             if self.pending and self.pending[0] == "calibrate":
                 self.arduino_initialized = True
@@ -431,27 +449,118 @@ class MainWindow(QMainWindow):
         elif kind == "moving":
             self.motion_busy = True
         elif kind == "stationary":
-            # Arduino responds to STOP without any subsequent HOLDING line
-            # when it was already stopped. Never leave the GUI stuck busy.
+            prior = self.pending
             self.pending = None
             self.motion_busy = False
+            self.active_jog = ""
+            self.jog_stopping = False
+            self.jog_timer.stop()
+            if prior and prior[0] == "jog" and self.desired_jog:
+                QTimer.singleShot(0, self._start_desired_jog)
         elif kind in ("completed", "stopped"):
-            # Actual motion completion is followed by position and HOLDING.
+            # Position and HOLDING follow completion of an actual movement.
             self.motion_busy = True
         elif kind == "position":
             if self.arduino_initialized:
                 self.arduino_position = value
         elif kind == "idle":
-            if self.pending and self.pending[0] == "move":
-                self.pending = None
+            prior = self.pending
+            self.pending = None
             self.motion_busy = False
+            self.active_jog = ""
+            self.jog_stopping = False
+            self.jog_timer.stop()
+            if prior and prior[0] == "jog" and self.desired_jog:
+                QTimer.singleShot(0, self._start_desired_jog)
         elif kind == "error":
             self.pending = None
             self.motion_busy = False
+            self.active_jog = ""
+            self.desired_jog = ""
+            self.jog_stopping = False
+            self.jog_timer.stop()
             if "Calibrate" in value or "calibrat" in value.lower():
                 self.arduino_initialized = False
                 self.arduino_position = None
         self.update_position()
+
+    def _issue_unconditional_stop(self, reason: str) -> None:
+        """Send STOP even when the GUI incorrectly believes the motor is idle.
+
+        Safety-critical requests must never be gated on cached UI state.
+        The firmware remains the authority on whether motion is active.
+        """
+        self.jog_timer.stop()
+        self.active_jog = ""
+        self.jog_stopping = True
+        if not (self.real_mode and self.serial_manager.is_connected):
+            self.log.append("STOP impossible : Arduino USB déconnecté. Coupez l'alimentation moteur.")
+            self.update_position()
+            return
+        try:
+            self.serial_manager.send_command("STOP")
+            self.log.append("PC > STOP (" + reason + ")")
+            # Reconcile an uncertain GUI state with the actual controller.
+            self.serial_manager.send_command("P")
+        except ConnectionError as error:
+            self.on_serial_error(str(error))
+            self.log.append("STOP non confirmé : coupez l'alimentation moteur.")
+            return
+        self.motion_busy = True
+        # Keep a pending marker until the firmware confirms stationary/holding.
+        self.pending = ("jog_stop", None)
+        self.update_position()
+
+    def request_jog_command(self, command: str):
+        """Start FAST/SLOW jogging, or ALWAYS ask Arduino to stop on neutral."""
+        if command not in ("", "FAST +", "FAST -", "SLOW +", "SLOW -"):
+            return
+        if not self.real_mode:
+            return
+        previous = self.desired_jog
+        self.desired_jog = command
+        if not command:
+            # Releasing a stick must not rely on self.pending/motion_busy.
+            # Only send when the stick was previously requesting movement.
+            if previous or self.active_jog or (self.pending and self.pending[0] == "jog"):
+                self._issue_unconditional_stop("stick released")
+            return
+        if self.pending and self.pending[0] in ("jog", "jog_stop"):
+            if command == self.active_jog and not self.jog_stopping:
+                return
+            if not self.jog_stopping:
+                self._issue_unconditional_stop("change of direction or speed")
+            return
+        if self.motion_busy:
+            return
+        self._start_desired_jog()
+
+    def _start_desired_jog(self):
+        """Issue one FAST/SLOW command only after the stage becomes idle."""
+        if not self.desired_jog or not self.is_ready_for_motion():
+            return
+        command = self.desired_jog
+        self.jog_stopping = False
+        if self.send_real(command, ("jog", command)):
+            self.active_jog = command
+            self.motion_busy = True
+            self.jog_timer.start()
+            self._send_jog_heartbeat()
+            self.update_position()
+
+    def _send_jog_heartbeat(self):
+        """Refresh the firmware's independent FAST/SLOW watchdog at 10 Hz."""
+        if not (self.real_mode and self.serial_manager.is_connected
+                and self.pending and self.pending[0] == "jog"
+                and self.active_jog and not self.jog_stopping):
+            self.jog_timer.stop()
+            return
+        try:
+            self.serial_manager.send_command("HB")
+        except ConnectionError as error:
+            self.jog_timer.stop()
+            self.desired_jog = ""
+            self.on_serial_error(str(error))
 
     def send_real(self, command, pending=None):
         try:
@@ -493,8 +602,12 @@ class MainWindow(QMainWindow):
         self.update_position()
 
     def move_relative(self, direction):
-        """Request one signed increment from GUI buttons or the gamepad."""
+        """Request one signed increment from GUI buttons or the triggers."""
         distance = float(self.step_selector.currentText()) * direction
+        self.request_relative_distance(distance)
+
+    def request_relative_distance(self, distance):
+        """Validate one signed displacement from buttons, triggers, or sticks."""
         if self.real_mode:
             if not self.is_ready_for_motion():
                 return
@@ -540,16 +653,9 @@ class MainWindow(QMainWindow):
         return True
 
     def stop_motion(self):
-        """Request controlled deceleration; not an emergency power cutoff."""
-        if self.real_mode and self.serial_manager.is_connected:
-            if not self.motion_busy and not self.pending:
-                self.log.append("Aucun mouvement en cours : STOP inutile.")
-                return
-            # STOP remains available while a movement is pending.
-            # Never replace the pending movement with an untracked command.
-            self.send_real("STOP", self.pending)
-        elif not self.real_mode:
-            self.log.append("Simulation : aucun mouvement en cours.")
+        """STOP is always transmitted when USB is connected, even if GUI is idle."""
+        self.desired_jog = ""
+        self._issue_unconditional_stop("STOP button")
 
     def connect_gamepad(self):
         if self.gamepad is None:
@@ -559,6 +665,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Manette", str(error))
                 return
             self.gamepad.move_requested.connect(self.move_relative)
+            self.gamepad.step_requested.connect(self.request_relative_distance)
+            self.gamepad.jog_requested.connect(self.request_jog_command)
             self.gamepad.stop_requested.connect(self.stop_motion)
             self.gamepad.status_changed.connect(self.gamepad_status.setText)
         self.gamepad.connect_gamepad()

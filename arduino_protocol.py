@@ -27,7 +27,8 @@ def parse_message(line: str) -> tuple[str, object]:
         return ("stationary", None)
     if line == "State: HOLDING":
         return ("idle", None)
-    if line == "State: MOVING":
+    if line in ("State: MOVING", "State: CONTINUOUS",
+                "State: STOPPING", "State: MOVING TO TARGET"):
         return ("moving", None)
     if line.startswith("ERROR:") or line in (
         "Calibrate first with C.", "Stop and wait before calibration.",
