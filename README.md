@@ -165,11 +165,17 @@ Common firmware responses include `Calibration accepted.`, `Moving to ...`, `Tar
 
 ## Authors
 - **Team 5:** 
+
         - CASTILLO TURRUBIARTES Eunice Saraí
+
         - LIU Binhao
+
         - WANG Qia
+
         - LEI Yumian
+
   École Centrale de Lille
 - **M. Simon BOUVEL**
+
   École Centrale de Lille
 
