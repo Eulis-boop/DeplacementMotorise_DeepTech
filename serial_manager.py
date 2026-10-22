@@ -4,6 +4,7 @@ from PySide6.QtSerialPort import QSerialPort, QSerialPortInfo
 
 
 class SerialManager(QObject):
+    """Non-blocking Qt serial transport; one line per Arduino message."""
     connected = Signal()
     disconnected = Signal()
     message_received = Signal(str)
@@ -23,9 +24,11 @@ class SerialManager(QObject):
 
     @staticmethod
     def available_ports():
+        """List ports without assuming OS-specific device names."""
         return [(p.portName(), p.description()) for p in QSerialPortInfo.availablePorts()]
 
     def connect_port(self, port_name):
+        """Open a selected device at the firmware baud rate (115200)."""
         if self.is_connected:
             self.disconnect_port()
         self.buffer.clear()
@@ -43,6 +46,7 @@ class SerialManager(QObject):
             self.disconnected.emit()
 
     def send_command(self, command):
+        """Queue a newline-terminated ASCII command without blocking Qt."""
         if not self.is_connected:
             raise ConnectionError("Arduino non connecté.")
         data = (command.rstrip("\r\n") + "\n").encode("ascii")
@@ -50,6 +54,7 @@ class SerialManager(QObject):
             raise ConnectionError(self.serial.errorString())
 
     def read_data(self):
+        """Buffer fragmented serial data and emit only complete text lines."""
         self.buffer.extend(bytes(self.serial.readAll()))
         if len(self.buffer) > 8192:
             self.buffer.clear()
@@ -63,6 +68,7 @@ class SerialManager(QObject):
                 self.message_received.emit(msg)
 
     def handle_error(self, error):
+        """Report I/O errors and close a disconnected or inaccessible port."""
         if error in (QSerialPort.SerialPortError.NoError,
                      QSerialPort.SerialPortError.TimeoutError):
             return

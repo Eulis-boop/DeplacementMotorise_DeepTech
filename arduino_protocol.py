@@ -4,7 +4,13 @@ import re
 POSITION = re.compile(r"^Estimated position:\s*([-+]?\d+(?:\.\d+)?)\s*mm$")
 
 
-def parse_message(line):
+def parse_message(line: str) -> tuple[str, object]:
+    """Classify one line of the existing human-readable Arduino protocol.
+
+    This is not a structured acknowledgement protocol: a completion line
+    must be paired with a later position/state response for GUI updates.
+    Unrecognized lines remain informational and must not imply success.
+    """
     line = line.strip()
     match = POSITION.match(line)
     if match:

@@ -1,102 +1,91 @@
-"""Optional incremental gamepad input. Commands always pass through the GUI checks."""
+"""Optional BEITONG gamepad input, converted to incremental GUI requests.
+
+The observed Xbox 360 mapping on macOS uses LT axis 5, RT axis 4 and
+B button 1. Mappings and neutral trigger values can vary by connection
+mode and operating system; verify them in simulation before real motion.
+"""
+
 import pygame
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, QTimer, Signal
 
 
 class GamepadController(QObject):
-    move_requested = Signal(int)
+    """Emit movement/stop requests; never communicate directly with Arduino."""
+
+    move_requested = Signal(int)  # -1 backwards, +1 forwards
     stop_requested = Signal()
     status_changed = Signal(str)
+
+    LT_AXIS = 5
+    RT_AXIS = 4
+    STOP_BUTTON = 1
+    PRESS_THRESHOLD = 0.5
+    RELEASE_THRESHOLD = -0.2
 
     def __init__(self, parent=None):
         super().__init__(parent)
         pygame.init()
         pygame.joystick.init()
         self.joystick = None
-        self.last_direction = 0
-        self.last_stop = False
+        self.lt_pressed = False
+        self.rt_pressed = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll_gamepad)
         self.timer.start(50)
-        # Configuration provisoire des gâchettes
-        self.lt_axis = 5
-        self.rt_axis = 4
-
-        self.lt_pressed = False
-        self.rt_pressed = False
-
-        self.press_threshold = 0.5
-        self.release_threshold = -0.2
 
     def connect_gamepad(self):
+        """Connect to the first detected gamepad; reset input latches."""
         pygame.event.pump()
         if pygame.joystick.get_count() == 0:
             self.status_changed.emit("Aucune manette détectée")
             return
         self.joystick = pygame.joystick.Joystick(0)
         self.joystick.init()
-        self.last_direction = 0
-        self.last_stop = False
+        self.lt_pressed = False
+        self.rt_pressed = False
         self.status_changed.emit(f"Manette : {self.joystick.get_name()}")
 
-    
+    def process_trigger(self, axis: int, value: float):
+        """Emit only one step per trigger press, using hysteresis.
+
+        These thresholds assume an axis which rests near -1 and increases
+        toward +1 when pressed. Recalibrate if the mapping is different.
+        """
+        if axis == self.LT_AXIS:
+            if value >= self.PRESS_THRESHOLD and not self.lt_pressed:
+                self.lt_pressed = True
+                self.move_requested.emit(-1)
+            elif value <= self.RELEASE_THRESHOLD:
+                self.lt_pressed = False
+        elif axis == self.RT_AXIS:
+            if value >= self.PRESS_THRESHOLD and not self.rt_pressed:
+                self.rt_pressed = True
+                self.move_requested.emit(1)
+            elif value <= self.RELEASE_THRESHOLD:
+                self.rt_pressed = False
+
     def poll_gamepad(self):
+        """Handle pending pygame events on the Qt event loop."""
         for event in pygame.event.get():
-
             if event.type == pygame.JOYDEVICEREMOVED:
-                self.joystick = None
-                self.last_direction = 0
-                self.status_changed.emit("Manette déconnectée")
-                self.stop_requested.emit()
-                return
-
-            if self.joystick is None:
+                if self.joystick is not None and event.instance_id == self.joystick.get_instance_id():
+                    self.joystick = None
+                    self.lt_pressed = self.rt_pressed = False
+                    self.status_changed.emit("Manette déconnectée")
+                    # A software stop is best-effort, not a hardware fail-safe.
+                    self.stop_requested.emit()
                 continue
 
-            if event.type == pygame.JOYBUTTONDOWN:
-
-                # LB : Reculer
-                if event.button == 9:
-                    self.move_requested.emit(-1)
-
-                # RB : Avancer
-                elif event.button == 10:
-                    self.move_requested.emit(1)
-
             if self.joystick is None or not self.joystick.get_init():
-                return
-            # Typical first hat = horizontal D-pad. Not all controllers have hats.
-            direction = self.joystick.get_hat(0)[0] if self.joystick.get_numhats() else 0
-            if direction != 0 and self.last_direction == 0:
-                self.move_requested.emit(direction)
-            self.last_direction = direction
-            # Button indices differ by controller: test mapping before using this as STOP.
-            if self.joystick.get_numbuttons() > 1:
-                pressed = bool(self.joystick.get_button(1))
-                if pressed and not self.last_stop:
-                    self.stop_requested.emit()
-                self.last_stop = pressed            
-
-            if event.type == pygame.JOYAXISMOTION:
+                continue
+            if getattr(event, "instance_id", self.joystick.get_instance_id()) != self.joystick.get_instance_id():
+                continue
+            if event.type == pygame.JOYBUTTONDOWN and event.button == self.STOP_BUTTON:
+                self.stop_requested.emit()
+            elif event.type == pygame.JOYAXISMOTION:
                 self.process_trigger(event.axis, event.value)
 
     def close(self):
+        """Release pygame resources before quitting the Qt application."""
         self.timer.stop()
         pygame.quit()
-
-    def process_trigger(self, axis, value):
-        if axis == self.lt_axis:
-            if value >= self.press_threshold and not self.lt_pressed:
-                self.lt_pressed = True
-                self.move_requested.emit(-1)  # Reculer
-
-            elif value <= self.release_threshold:
-                self.lt_pressed = False
-
-        elif axis == self.rt_axis:
-            if value >= self.press_threshold and not self.rt_pressed:
-                self.rt_pressed = True
-                self.move_requested.emit(1)  # Avancer
-
-            elif value <= self.release_threshold:
-                self.rt_pressed = False

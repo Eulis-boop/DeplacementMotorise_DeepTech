@@ -1,4 +1,8 @@
-"""DeepTech — Déplacement motorisé"""
+"""PySide6 interface for simulated and Arduino-controlled stage positioning.
+
+All displayed Arduino positions are step-based estimates rather than
+independent sensor measurements. The GUI cannot serve as an emergency stop.
+"""
 
 import sys
 
@@ -105,6 +109,7 @@ QScrollArea { border: none; background: #f5f7fb; }
 
 
 def make_card(title: str):
+    """Create a consistently styled control section."""
     card = QFrame()
     card.setObjectName("card")
     layout = QVBoxLayout(card)
@@ -117,6 +122,7 @@ def make_card(title: str):
 
 
 class MainWindow(QMainWindow):
+    """Coordinate GUI actions, simulator, USB protocol, and gamepad input."""
     def __init__(self):
         super().__init__()
         self.motor = MotionController()
@@ -292,7 +298,7 @@ class MainWindow(QMainWindow):
         self.gamepad_button.clicked.connect(self.connect_gamepad)
         safety_row.addWidget(self.gamepad_button)
         safety_layout.addLayout(safety_row)
-        self.gamepad_status = QLabel("Manette inactive. D-pad: avance/recul; bouton 1: STOP (à vérifier).")
+        self.gamepad_status = QLabel("Manette inactive. LT : reculer, RT : avancer, B : STOP (configuration à vérifier).")
         self.gamepad_status.setObjectName("hint")
         self.gamepad_status.setWordWrap(True)
         safety_layout.addWidget(self.gamepad_status)
@@ -317,7 +323,7 @@ class MainWindow(QMainWindow):
         self.update_position()
 
     def parse_position(self, field):
-        """Accepte 7.88 ou 7,88 ; vérifie la plage et les centièmes."""
+        """Parse comma/dot decimals, reject out-of-range or sub-0.01 mm inputs."""
         raw = field.text().strip().replace(",", ".")
         try:
             value = float(raw)
@@ -345,7 +351,11 @@ class MainWindow(QMainWindow):
             self.port_selector.addItem(f"{name} — {desc}", name)
 
     def change_mode(self):
+        # The mode selector is normally disabled during a pending command.
         if self.motion_busy or self.pending:
+            self.mode_selector.blockSignals(True)
+            self.mode_selector.setCurrentIndex(1 if self.serial_manager.is_connected else 0)
+            self.mode_selector.blockSignals(False)
             return
         if self.serial_manager.is_connected:
             self.serial_manager.disconnect_port()
@@ -390,7 +400,7 @@ class MainWindow(QMainWindow):
     def on_serial_error(self, reason):
         self.log.append("Erreur USB : " + reason)
         if self.motion_busy or self.pending:
-            self.clear_real_position("Communication incertaine : nouvelle calibration requise")
+            self.clear_real_position("Communication incertaine : vérifier physiquement le moteur et recalibrer")
         self.update_position()
 
     def query_position(self):
@@ -401,6 +411,7 @@ class MainWindow(QMainWindow):
                 self.on_serial_error(str(error))
 
     def on_serial_message(self, line):
+        """Apply firmware messages without assuming that sending equals execution."""
         self.log.append("Arduino > " + line)
         kind, value = parse_message(line)
         if kind == "restarted":
@@ -482,6 +493,7 @@ class MainWindow(QMainWindow):
         self.update_position()
 
     def move_relative(self, direction):
+        """Request one signed increment from GUI buttons or the gamepad."""
         distance = float(self.step_selector.currentText()) * direction
         if self.real_mode:
             if not self.is_ready_for_motion():
@@ -528,6 +540,7 @@ class MainWindow(QMainWindow):
         return True
 
     def stop_motion(self):
+        """Request controlled deceleration; not an emergency power cutoff."""
         if self.real_mode and self.serial_manager.is_connected:
             if not self.motion_busy and not self.pending:
                 self.log.append("Aucun mouvement en cours : STOP inutile.")
@@ -604,7 +617,8 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event):
-        if self.real_mode and self.serial_manager.is_connected and self.motion_busy:
+        """Avoid closing during a known active motion and release resources."""
+        if self.real_mode and self.serial_manager.is_connected and (self.motion_busy or self.pending):
             QMessageBox.warning(self, "Mouvement actif",
                                 "Arrêtez le moteur et attendez sa confirmation avant de fermer.")
             event.ignore()
